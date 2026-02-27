@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Barcode Scan Speed Test (BLE)</title>
+    <style>
+        body { font-family: monospace; padding: 20px; max-width: 760px; }
+        h1 { font-size: 1.2em; }
+        button { padding: 8px 16px; margin-right: 8px; cursor: pointer; }
+        button:disabled { opacity: 0.4; cursor: default; }
+        #status { margin: 12px 0; padding: 8px; background: #f0f0f0; border-radius: 4px; }
+        #status.connected { background: #d4edda; }
+        #status.error { background: #f8d7da; }
+        .scan-entry { border: 1px solid #ccc; border-radius: 4px; padding: 10px; margin-bottom: 10px; }
+        .scan-entry .barcode { font-size: 1.1em; font-weight: bold; }
+        .scan-entry .timing { color: #555; font-size: 0.9em; margin-top: 4px; }
+        .scan-entry .packets { color: #777; font-size: 0.85em; margin-top: 2px; }
+        #discovery { background: #fffbe6; border: 1px solid #ffe58f; border-radius: 4px; padding: 12px; margin-top: 12px; display: none; }
+        #discovery h2 { font-size: 1em; margin: 0 0 8px; }
+        .svc { margin-bottom: 8px; }
+        .svc-uuid { font-weight: bold; }
+        .char-uuid { padding-left: 16px; color: #444; }
+        .char-props { color: #888; font-size: 0.85em; }
+        summary { cursor: pointer; }
+        #reconnectBtn { background: #d4edda; border: 1px solid #a3d4a8; }
+        #reconnectBtn:disabled { background: none; border: none; }
+    </style>
+</head>
+<body>
+    <h1>Barcode Scan Speed Test &mdash; BLE</h1>
+
+    <details open>
+        <summary>Connection settings</summary>
+        <div style="margin-top:8px;">
+            <p style="margin:4px 0; font-size:0.9em;">
+                Connect will first try common BLE UART service UUIDs automatically.
+                If none match, use <strong>Discover Services</strong> to find the right UUID for your scanner,
+                then paste it below.
+            </p>
+            <label style="display:block; margin:8px 0 2px; font-size:0.9em;">Override Service UUID (leave blank for auto-detect):</label>
+            <input type="text" id="serviceUUID" placeholder="e.g. 0000ae30-0000-1000-8000-00805f9b34fb" style="width:420px; font-family:monospace; padding:4px;">
+            <label style="display:block; margin:8px 0 2px; font-size:0.9em;">Override TX Characteristic UUID (scanner to browser, leave blank for auto-detect):</label>
+            <input type="text" id="txUUID" placeholder="e.g. 0000ae02-0000-1000-8000-00805f9b34fb" style="width:420px; font-family:monospace; padding:4px;">
+        </div>
+    </details>
+
+    <div style="margin-top: 12px;">
+        <button id="reconnectBtn" disabled>Reconnect</button>
+        <button id="connectBtn">Connect &amp; Auto-detect</button>
+        <button id="discoverBtn">Discover Services Only</button>
+        <button id="disconnectBtn" disabled>Disconnect</button>
+        <button id="clearBtn">Clear Log</button>
+        <button onclick="location.reload()">Refresh Page</button>
+    </div>
+
+    <div id="status">Disconnected</div>
+    <div id="discovery"></div>
+    <div id="log"></div>
+
+    <script>
+    const KNOWN_SERVICES = [
+        {
+            service: '0000ae30-0000-1000-8000-00805f9b34fb',
+            tx:      '0000ae02-0000-1000-8000-00805f9b34fb',
+            label:   'AE30/AE02 (your scanner)',
+        },
+        {
+            service: '0000ffe0-0000-1000-8000-00805f9b34fb',
+            tx:      '0000ffe1-0000-1000-8000-00805f9b34fb',
+            label:   'FFE0/FFE1 (HM-10)',
+        },
+        {
+            service: '6e400001-b5b3-f393-e0a9-e50e24dcca9e',
+            tx:      '6e400003-b5b3-f393-e0a9-e50e24dcca9e',
+            label:   'Nordic UART Service (NUS)',
+        },
+        {
+            service: '0000fff0-0000-1000-8000-00805f9b34fb',
+            tx:      '0000fff1-0000-1000-8000-00805f9b34fb',
+            label:   'FFF0/FFF1',
+        },
+        {
+            service: '0000ff00-0000-1000-8000-00805f9b34fb',
+            tx:      '0000ff01-0000-1000-8000-00805f9b34fb',
+            label:   'FF00/FF01',
+        },
+        {
+            service: '0000ffe5-0000-1000-8000-00805f9b34fb',
+            tx:      '0000ffe4-0000-1000-8000-00805f9b34fb',
+            label:   'FFE5/FFE4',
+        },
+        {
+            service: '00001812-0000-1000-8000-00805f9b34fb',
+            tx:      '00002a4d-0000-1000-8000-00805f9b34fb',
+            label:   'HID / BLE_SCANNER (1812/2A4D)',
+        },
+    ];
+
+    const STANDARD_SERVICES = [
+        '00001800-0000-1000-8000-00805f9b34fb',
+        '00001801-0000-1000-8000-00805f9b34fb',
+        '0000180a-0000-1000-8000-00805f9b34fb',
+        '0000180f-0000-1000-8000-00805f9b34fb',
+        '00001812-0000-1000-8000-00805f9b34fb',
+    ];
+
+    const ALL_OPTIONAL_SERVICES = [
+        ...KNOWN_SERVICES.map(s => s.service),
+        ...STANDARD_SERVICES,
+        '0000ae3a-0000-1000-8000-00805f9b34fb',
+    ];
+
+    const reconnectBtn  = document.getElementById('reconnectBtn');
+    const connectBtn    = document.getElementById('connectBtn');
+    const discoverBtn   = document.getElementById('discoverBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const clearBtn      = document.getElementById('clearBtn');
+    const statusEl      = document.getElementById('status');
+    const discoveryEl   = document.getElementById('discovery');
+    const logEl         = document.getElementById('log');
+
+    let gattServer  = null;
+    let txChar      = null;
+    let scanBuffer  = '';
+    let scanStart   = 0;
+    let packetTimes = [];
+    const decoder   = new TextDecoder();
+
+    function setStatus(msg, cls = '') {
+        statusEl.textContent = msg;
+        statusEl.className = cls;
+    }
+
+    function errMsg(err) {
+        if (!err) return 'Unknown error';
+        if (typeof err === 'string') return err;
+        return err.message || err.name || String(err) || 'Unknown error';
+    }
+
+    function setConnected(isConnected) {
+        connectBtn.disabled    = isConnected;
+        discoverBtn.disabled   = isConnected;
+        disconnectBtn.disabled = !isConnected;
+        reconnectBtn.disabled  = isConnected;
+    }
+
+    // Connect to a device. watchAdvertisements() triggers the BLE scan that makes
+    // the device connectable cross-session; the retry loop keeps attempting
+    // gatt.connect() until the scan takes effect.
+    async function connectViaAdvertisement(device, { maxAttempts = 20, delayMs = 2000 } = {}) {
+        setStatus(`Connecting to ${device.name || 'device'}…`);
+
+        if (device.watchAdvertisements) {
+            device.watchAdvertisements().catch(() => {});
+        }
+
+        try {
+            let lastErr;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    await connectToDevice(device);
+                    return;
+                } catch (err) {
+                    lastErr = err;
+                    if (attempt < maxAttempts) {
+                        await new Promise(r => setTimeout(r, delayMs));
+                    }
+                }
+            }
+            throw lastErr;
+        } finally {
+            device.unwatchAdvertisements?.().catch(() => {});
+        }
+    }
+
+    // On page load: silently attempt to reconnect to a previously permitted device.
+    async function autoConnectOnLoad() {
+        if (!navigator.bluetooth?.getDevices) return;
+        const devices = await navigator.bluetooth.getDevices();
+        if (devices.length === 0) return;
+
+        const device = devices[devices.length - 1];
+        reconnectBtn.title = `Previously permitted: ${device.name || 'unnamed'}`;
+
+        try {
+            await connectViaAdvertisement(device, { maxAttempts: 1 });
+        } catch {
+            reconnectBtn.disabled = false;
+            setStatus(`Could not auto-connect — tap Reconnect to try again or use Connect & Auto-detect.`);
+        }
+    }
+    autoConnectOnLoad();
+
+    async function connectToDevice(device, statusMsg = null) {
+        device.addEventListener('gattserverdisconnected', () => {
+            setStatus(`Disconnected from ${device.name || 'device'}`, 'error');
+            setConnected(false);
+            reconnectBtn.disabled = false;
+            txChar = null;
+        });
+
+        setStatus(statusMsg ?? `Connecting to ${device.name || 'device'}...`);
+        gattServer = await Promise.race([
+            device.gatt.connect(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('connect timeout')), 3000)),
+        ]);
+
+        const overrideSvc = document.getElementById('serviceUUID').value.trim();
+        const overrideTx  = document.getElementById('txUUID').value.trim();
+        let matched = null;
+
+        if (overrideSvc && overrideTx) {
+            const svc  = await gattServer.getPrimaryService(overrideSvc);
+            txChar = await svc.getCharacteristic(overrideTx);
+            matched = { label: 'manual override', service: overrideSvc, tx: overrideTx };
+        } else {
+            for (const candidate of KNOWN_SERVICES) {
+                try {
+                    const svc  = await gattServer.getPrimaryService(candidate.service);
+                    const char = await svc.getCharacteristic(candidate.tx);
+                    if (char.properties.notify || char.properties.indicate) {
+                        txChar  = char;
+                        matched = candidate;
+                        break;
+                    }
+                } catch (_) {}
+            }
+        }
+
+        if (!txChar) {
+            setStatus('Could not find a known BLE UART service. Use "Discover Services Only" to find the right UUID.', 'error');
+            gattServer.disconnect();
+            return;
+        }
+
+        await txChar.startNotifications();
+        txChar.addEventListener('characteristicvaluechanged', handleNotification);
+
+        setConnected(true);
+        setStatus(`Connected to ${device.name || 'device'} via ${matched.label} — scan a barcode`, 'connected');
+        console.log(`Using service ${matched.service} / char ${matched.tx}`);
+    }
+
+    async function requestDevice() {
+        const extraServices = [];
+        const override = document.getElementById('serviceUUID').value.trim();
+        if (override) extraServices.push(override);
+
+        return navigator.bluetooth.requestDevice({
+            acceptAllDevices: true,
+            optionalServices: [...new Set([...ALL_OPTIONAL_SERVICES, ...extraServices])],
+        });
+    }
+
+    // --- Reconnect (no picker dialog, retries until device is advertising) ---
+    reconnectBtn.addEventListener('click', async () => {
+        if (!navigator.bluetooth) {
+            setStatus('Web Bluetooth not available.', 'error');
+            return;
+        }
+        try {
+            // Build name filters from previously permitted devices so the picker
+            // only shows devices the user has connected to before.
+            let filters;
+            if (navigator.bluetooth.getDevices) {
+                const prev = await navigator.bluetooth.getDevices();
+                const names = prev.map(d => d.name).filter(Boolean);
+                if (names.length > 0) {
+                    filters = names.map(name => ({ name }));
+                }
+            }
+
+            const overrideSvc = document.getElementById('serviceUUID').value.trim();
+            const requestOptions = {
+                optionalServices: [...new Set([
+                    ...ALL_OPTIONAL_SERVICES,
+                    ...(overrideSvc ? [overrideSvc] : []),
+                ])],
+            };
+            requestOptions[filters ? 'filters' : 'acceptAllDevices'] = filters ?? true;
+
+            setStatus('Select your scanner…');
+            const device = await navigator.bluetooth.requestDevice(requestOptions);
+            await connectToDevice(device);
+        } catch (err) {
+            setStatus(`Could not connect. (${errMsg(err)})`, 'error');
+            console.error(err);
+        }
+    });
+
+    // --- Connect (with picker dialog) ---
+    connectBtn.addEventListener('click', async () => {
+        if (!navigator.bluetooth) {
+            setStatus('Web Bluetooth not available. Use Chrome or Edge on desktop.', 'error');
+            return;
+        }
+        try {
+            setStatus('Select your scanner in the dialog...');
+            const device = await requestDevice();
+            await connectToDevice(device);
+        } catch (err) {
+            setStatus(`Error: ${errMsg(err)}`, 'error');
+            console.error(err);
+        }
+    });
+
+    // --- Service discovery (no notifications) ---
+    discoverBtn.addEventListener('click', async () => {
+        if (!navigator.bluetooth) {
+            setStatus('Web Bluetooth not available. Use Chrome or Edge on desktop.', 'error');
+            return;
+        }
+        try {
+            setStatus('Select your scanner in the dialog...');
+            const device = await requestDevice();
+            setStatus(`Connecting to ${device.name || 'device'} for discovery...`);
+            const server   = await device.gatt.connect();
+            const services = await server.getPrimaryServices();
+
+            let html = '';
+            if (services.length === 0) {
+                html = `<h2>No services found via Web Bluetooth</h2>
+                    <p style="font-size:0.9em;">
+                        <strong>Web Bluetooth can only show services that were pre-declared</strong> — if the
+                        scanner uses a custom UUID not in our list, the browser hides it entirely.<br><br>
+                        <strong>To find the real UUIDs:</strong> use LightBlue (Mac/iOS) or nRF Connect (Android),
+                        connect to your scanner, and note the service UUID and the characteristic with
+                        <em>Notify</em> property. Then paste both UUIDs into the fields above and click
+                        <em>Connect &amp; Auto-detect</em>.
+                    </p>`;
+            } else {
+                html = '<h2>Discovered GATT Services</h2>';
+                for (const svc of services) {
+                    html += `<div class="svc"><span class="svc-uuid">Service: ${svc.uuid}</span>`;
+                    const chars = await svc.getCharacteristics();
+                    for (const c of chars) {
+                        const props = Object.keys(c.properties).filter(k => c.properties[k]).join(', ');
+                        html += `<div class="char-uuid">Char: ${c.uuid} <span class="char-props">[${props}]</span></div>`;
+                    }
+                    html += '</div>';
+                }
+                html += '<p style="font-size:0.85em;">Paste a Service UUID + a <strong>notify</strong> Characteristic UUID into the fields above, then click <em>Connect &amp; Auto-detect</em>.</p>';
+            }
+
+            discoveryEl.innerHTML = html;
+            discoveryEl.style.display = 'block';
+            server.disconnect();
+            setStatus('Discovery complete — see results below.');
+        } catch (err) {
+            setStatus(`Error: ${errMsg(err)}`, 'error');
+            console.error(err);
+        }
+    });
+
+    // --- Disconnect ---
+    disconnectBtn.addEventListener('click', () => {
+        if (txChar) txChar.stopNotifications().catch(() => {});
+        if (gattServer?.connected) gattServer.disconnect();
+        setStatus('Disconnected');
+        setConnected(false);
+        txChar = null;
+    });
+
+    clearBtn.addEventListener('click', () => { logEl.innerHTML = ''; });
+
+    // --- BLE notification handler ---
+    function handleNotification(event) {
+        const now   = Date.now();
+        const chunk = decoder.decode(event.target.value, { stream: true });
+
+        if (!scanStart) scanStart = now;
+        packetTimes.push(now - scanStart);
+        scanBuffer += chunk;
+
+        if (/[\r\n]/.test(scanBuffer)) {
+            const totalMs = now - scanStart;
+            const barcode = scanBuffer.replace(/[\r\n]+$/, '');
+            logScan(barcode, totalMs, [...packetTimes]);
+
+            scanBuffer  = '';
+            scanStart   = 0;
+            packetTimes = [];
+        }
+    }
+
+    function logScan(barcode, totalMs, packets) {
+        const entry = document.createElement('div');
+        entry.className = 'scan-entry';
+
+        const packetDetail = packets.length > 1
+            ? `${packets.length} BLE packets, offsets from first: ${packets.map(t => t + 'ms').join(', ')}`
+            : `1 BLE packet (full payload in single notification)`;
+
+        entry.innerHTML = `
+            <div class="barcode">${escapeHtml(barcode)}</div>
+            <div class="timing">Total BLE transmission time: <strong>${totalMs}ms</strong></div>
+            <div class="packets">${packetDetail}</div>
+        `;
+        logEl.prepend(entry);
+
+        console.log(`Barcode: ${barcode}`);
+        console.log(`Total: ${totalMs}ms | Packets: ${packets.length} | Offsets: ${packets.join(', ')}ms`);
+    }
+
+    function escapeHtml(s) {
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+    </script>
+</body>
+</html>
